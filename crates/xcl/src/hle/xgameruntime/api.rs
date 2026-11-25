@@ -85,6 +85,8 @@ const XSYSTEM_V3_IID: Guid = g(0x6fd71f09_7513_49f0_89bc_bfaf5df6f852);
 const XANALYTICS: Guid = g(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
 const XFEATURE: Guid = g(0x8836fe87_edb9_4fe3_8dad_05f0d2cd5b40);
 const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
+/// XDisplayTryEnableHdrMode (its own class in the GDK table, see gdk_table.rs)
+const XDISPLAY_HDR: Guid = g(0x03f0fe74_fdd9_4e5c_b630_f9339c47acc5);
 const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
 pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
 pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
@@ -532,6 +534,7 @@ fn classes() -> Vec<Class> {
                 impls: vec![("XLaunchUri", launch_uri as usize), ("XDisplayAcquireTimeoutDeferral", display_deferral as usize), ("XDisplayCloseTimeoutDeferralHandle", nothing as usize)],
                 forward: &[],
             },
+            Class { name: "XDisplay (HDR)", clsid: XDISPLAY_HDR, impls: vec![("XDisplayTryEnableHdrMode", try_enable_hdr_mode as usize)], forward: &[] },
             // telemetry: offline, accepted and dropped
             Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
             Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking(), forward: &[] },
@@ -1002,6 +1005,13 @@ unsafe extern "system" fn add_by_id_async(id: u64, b: *mut XAsyncBlock) -> HRESU
 unsafe extern "system" fn launch_uri(_user: usize, uri: *const u8) -> HRESULT {
     crate::xlog_warn!("XLaunchUri({}) – refused", crate::util::from_cstr_ptr(uri).unwrap_or_default());
     E_NOTIMPL
+}
+
+/// XDisplayHdrModeResult::Disabled (Unknown = 0, Enabled = 1, Disabled = 2): without the PC runtime the
+/// title runs in SDR; the XDisplayHdrModeInfo out parameter is only filled when HDR is enabled.
+unsafe extern "system" fn try_enable_hdr_mode(_preference: u32, _info: usize) -> u32 {
+    crate::xlog_info!("XDisplayTryEnableHdrMode – HDR not enabled (SDR)");
+    2
 }
 
 /// nothing to defer on a PC

@@ -166,6 +166,10 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
         let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT = std::mem::transmute(pc_slot(primary, 10));
         f(primary, alloc, pso)
     };
+    static RESETS_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if hr < 0 || RESETS_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: title list {this:p} Reset(alloc {alloc:#x}, pso {pso:#x}): primary {primary:p}, adopted {adopted}, stand-in {} -> {hr:#x}", stand_in.is_some());
+    }
     if hr >= 0 {
         let active = stand_in.unwrap_or(primary as usize);
         *((this as usize + F_BACKING) as *mut usize) = active;

@@ -634,6 +634,56 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     *orig.add(slot)
 }
 
+/// Run `f` with `obj` (an adopted object) showing the PC runtime's own vtable pointer.
+///
+/// Microsoft's D3D12 takes an object it is handed (a list's Reset / CreateCommandList allocator)
+/// as it is; vkd3d-proton (Wine / Proton) checks that the vtable pointer is its own and refuses the
+/// object otherwise ("Invalid command allocator"). The adopted object keeps XCL's extended table
+/// for the title; only the native call sees the original. The original table is `ext[-1]`.
+/// Not an adopted object (or null): `f` runs unchanged. The pointer is put back when `f` returns,
+/// whatever it does; a call the title makes on the object from another thread in that window
+/// would see the native table (the title may not use an allocator from two threads at once).
+pub(super) unsafe fn with_native_vtable<R>(obj: usize, f: impl FnOnce() -> R) -> R {
+    if obj == 0 || !is_adopted(obj as *mut c_void) {
+        return f();
+    }
+    struct Restore(*mut usize, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe { *self.0 = self.1 }
+        }
+    }
+    let slot = obj as *mut usize;
+    let ext = *slot;
+    *slot = *(ext as *const usize).sub(1);
+    let _restore = Restore(slot, ext);
+    f()
+}
+
+/// `with_native_vtable` for several objects at once (ExecuteCommandLists: vkd3d-proton refuses a list
+/// whose vtable is not its own and then dereferences NULL). Duplicates are fine.
+pub(super) unsafe fn with_native_vtables<R>(objs: &[*mut c_void], f: impl FnOnce() -> R) -> R {
+    struct Restore(Vec<(*mut usize, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for &(p, v) in self.0.iter().rev() {
+                unsafe { *p = v }
+            }
+        }
+    }
+    let mut saved = Restore(Vec::new());
+    for &o in objs {
+        if o.is_null() || !is_adopted(o) {
+            continue;
+        }
+        let slot = o as *mut usize;
+        let ext = *slot;
+        *slot = *(ext as *const usize).sub(1);
+        saved.0.push((slot, ext));
+    }
+    f()
+}
+
 fn module_of(addr: usize) -> usize {
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -719,6 +769,9 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     }
     let v = vt(obj) as usize;
     if is_ext(v) {
+        return;
+    }
+    if kind == Kind::CommandAllocator && std::env::var_os("XCL_NO_ALLOC_ADOPT").is_some() {
         return;
     }
     let ext = class_for(obj, v, kind);
@@ -2742,7 +2795,10 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
-    let hr = f(this, allocator, resolved);
+    let hr = with_native_vtable(allocator as usize, || f(this, allocator, resolved));
+    if hr < 0 {
+        crate::xlog_warn!("D3D12.X: PC list {this:p} Reset(allocator {allocator:p}, pso {initial_state:p} -> {resolved:p}) -> {:#x}", hr as u32);
+    }
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
@@ -2901,7 +2957,13 @@ macro_rules! creator {
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
 creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [a1, a2]);
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
-creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+creator!(dev_create_command_list_native, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+
+/// CreateCommandList(node mask, type, allocator, initial pipeline, riid, list): the allocator
+/// goes to the PC runtime with its own vtable (`with_native_vtable`).
+pub(super) unsafe extern "system" fn dev_create_command_list(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    with_native_vtable(a3, || dev_create_command_list_native(this, a1, a2, a3, a4, riid, ppv))
+}
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
 
 /// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
@@ -2923,7 +2985,7 @@ pub(super) unsafe fn create_raw_pc_command_list(
         type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
         let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
         let f: F = std::mem::transmute(*vt(dev).add(slot));
-        let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
+        let hr = with_native_vtable(alloc, || f(dev, 0, ty, alloc, init_pso, &iid, &mut out));
         if hr >= 0 && !out.is_null() {
             adopt(out, Kind::CommandList);
         }
@@ -6560,7 +6622,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
-    f(raw)
+    with_native_vtable(raw as usize, || f(raw))
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
@@ -6772,7 +6834,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {
-        f(this, n, lists);
+        with_native_vtables(std::slice::from_raw_parts(lists, n as usize), || f(this, n, lists));
         stop_if_device_removed();
         return;
     }
@@ -6791,7 +6853,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        with_native_vtables(chunk, || f(this, chunk.len() as u32, chunk.as_ptr()));
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
